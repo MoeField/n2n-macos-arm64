@@ -231,7 +231,8 @@ static int utun_pend_add (uint32_t ip, const uint8_t *pkt, uint16_t len, time_t 
     if((len == 0) || (len > N2N_PKT_BUF_SIZE))
         return -1;
 
-    /* a packet to the same destination that is already waiting is dropped */
+    /* take the first free slot, or replace the entry waiting the longest if
+     * the queue is completely filled up */
     for(i = 0; i < N2N_UTUN_PEND_MAX; i++) {
         if(utun_ctx.pend[i].len == 0) {
             slot = i;
@@ -289,6 +290,38 @@ static int utun_resolve (uint32_t ip, uint8_t *mac) {
         return 0;
 
     return utun_neigh_lookup(ip, mac);
+}
+
+
+/* called as soon as the MAC address belonging to an overlay IP address is
+ * known: packets that were waiting for it are handed to the edge right away.
+ * tuntap_read() cannot do this, it only runs when the utun device delivers
+ * a new packet, which an application waiting for an answer does not. */
+static void utun_pend_flush (uint32_t ip) {
+
+    uint8_t frame[N2N_PKT_BUF_SIZE];
+    uint8_t mac[ETH_ADDR_LEN];
+    ether_hdr_t *eh = (ether_hdr_t*)frame;
+    int i;
+
+    if(!n2n_eth_tx_hook)
+        return;
+
+    if(utun_resolve(ip, mac) != 0)
+        return;
+
+    for(i = 0; i < N2N_UTUN_PEND_MAX; i++) {
+        if((utun_ctx.pend[i].len == 0) || (utun_ctx.pend[i].ip != ip))
+            continue;
+
+        memcpy(eh->dhost, mac, ETH_ADDR_LEN);
+        memcpy(eh->shost, utun_ctx.mac, ETH_ADDR_LEN);
+        eh->type = htons(N2N_UTUN_ETHERTYPE_IP);
+        memcpy(frame + ETH_FRAMESIZE, utun_ctx.pend[i].data, utun_ctx.pend[i].len);
+
+        n2n_eth_tx_hook(frame, ETH_FRAMESIZE + utun_ctx.pend[i].len);
+        utun_ctx.pend[i].len = 0;
+    }
 }
 
 
@@ -388,12 +421,18 @@ int tuntap_open (tuntap_dev *device,
         net_str = intoa(ntohl(net), net_buf, sizeof(net_buf));
         snprintf(buf, sizeof(buf), "ifconfig %s inet %s %s netmask %s mtu %u up",
                  utun_ctx.ifname, device_ip, net_str, device_mask, mtu);
-        system(buf);
+        if(system(buf) != 0)
+            traceEvent(TRACE_WARNING, "unable to bring up %s, please check: %s",
+                       utun_ctx.ifname, buf);
 
         /* all community members are reached through this interface */
         snprintf(buf, sizeof(buf), "route -n add -net %s -netmask %s -interface %s",
                  net_str, device_mask, utun_ctx.ifname);
-        system(buf);
+        if(system(buf) != 0)
+            /* an already existing route also makes route(8) fail, so this
+             * must not be treated as fatal */
+            traceEvent(TRACE_WARNING, "unable to add route through %s, please check: %s",
+                       utun_ctx.ifname, buf);
 
         traceEvent(TRACE_NORMAL, "Interface %s up and running (%s/%u, mtu %u)",
                    utun_ctx.ifname, device_ip, prefix, mtu);
@@ -507,20 +546,35 @@ int tuntap_read (struct tuntap_dev *tuntap, unsigned char *buf, int len) {
             utun_ctx.pend[i].len = 0;
             continue;
         }
-        if(utun_resolve(utun_ctx.pend[i].ip, dst_mac) == 0) {
-            ether_hdr_t *eh = (ether_hdr_t*)buf;
+    }
 
-            memcpy(eh->dhost, dst_mac, ETH_ADDR_LEN);
-            memcpy(eh->shost, utun_ctx.mac, ETH_ADDR_LEN);
-            eh->type = htons(N2N_UTUN_ETHERTYPE_IP);
-            memcpy(buf + ETH_FRAMESIZE, utun_ctx.pend[i].data, utun_ctx.pend[i].len);
-            n = ETH_FRAMESIZE + utun_ctx.pend[i].len;
-            utun_ctx.pend[i].len = 0;
+    /* ... anything whose neighbour is known by now goes out immediately,
+     * independent of how long it has been waiting */
+    for(i = 0; i < N2N_UTUN_PEND_MAX; i++) {
+        ether_hdr_t *eh;
 
-            return(n);
-        }
+        if(utun_ctx.pend[i].len == 0)
+            continue;
 
-        /* ... are retried from time to time */
+        if(utun_resolve(utun_ctx.pend[i].ip, dst_mac) != 0)
+            continue;
+
+        eh = (ether_hdr_t*)buf;
+        memcpy(eh->dhost, dst_mac, ETH_ADDR_LEN);
+        memcpy(eh->shost, utun_ctx.mac, ETH_ADDR_LEN);
+        eh->type = htons(N2N_UTUN_ETHERTYPE_IP);
+        memcpy(buf + ETH_FRAMESIZE, utun_ctx.pend[i].data, utun_ctx.pend[i].len);
+        n = ETH_FRAMESIZE + utun_ctx.pend[i].len;
+        utun_ctx.pend[i].len = 0;
+
+        return(n);
+    }
+
+    /* ... the rest is retried from time to time */
+    for(i = 0; i < N2N_UTUN_PEND_MAX; i++) {
+        if(utun_ctx.pend[i].len == 0)
+            continue;
+
         if(now - utun_ctx.pend[i].last_arp >= N2N_UTUN_ARP_RETRY) {
             utun_ctx.pend[i].last_arp = now;
             return(utun_build_arp(0x0001, broadcast_mac, utun_ctx.pend[i].ip,
@@ -627,6 +681,9 @@ int tuntap_write (struct tuntap_dev *tuntap, unsigned char *buf, int len) {
                 traceEvent(TRACE_DEBUG, "unable to answer ARP request, no way to send it");
         }
 
+        /* packets that have been waiting for this neighbour can go out now */
+        utun_pend_flush(sender_ip);
+
         return(len);
     }
 
@@ -648,6 +705,7 @@ int tuntap_write (struct tuntap_dev *tuntap, unsigned char *buf, int len) {
 
             memcpy(&src_ip, buf + ETH_FRAMESIZE + N2N_IP4_SRC_OFF, 4);
             utun_neigh_update(src_ip, eh->shost, now);
+            utun_pend_flush(src_ip);
         }
     }
 

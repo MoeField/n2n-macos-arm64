@@ -3122,6 +3122,13 @@ void edge_term (n2n_edge_t * eee) {
 
     closeTraceFile();
 
+    /* the device layer may still hold this hook, it must not outlive the
+     * edge it points into */
+    if(eth_tx_hook_eee == eee) {
+        eth_tx_hook_eee = NULL;
+        n2n_eth_tx_hook = NULL;
+    }
+
     free(eee);
 }
 
