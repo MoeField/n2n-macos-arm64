@@ -377,6 +377,18 @@ void supernode_disconnect (n2n_edge_t *eee) {
 
 /* ************************************** */
 
+/* Devices emulating a layer-2 interface on top of a layer-3 one (utun on
+ * macos) need to be able to send ethernet frames of their own. */
+n2n_eth_tx_hook_t n2n_eth_tx_hook = NULL;
+
+static n2n_edge_t *eth_tx_hook_eee = NULL;
+
+static void edge_tx_from_device (uint8_t *buf, size_t len) {
+
+    edge_send_packet2net(eth_tx_hook_eee, buf, len);
+}
+
+
 /** Initialise an edge to defaults.
  *
  *    This also initialises the NULL transform operation opstruct.
@@ -403,6 +415,10 @@ n2n_edge_t* edge_init (const n2n_edge_conf_t *conf, int *rv) {
     memcpy(&eee->conf, conf, sizeof(*conf));
     eee->curr_sn = eee->conf.supernodes;
     eee->start_time = time(NULL);
+
+    /* allow the tuntap device to send frames into the community on its own */
+    eth_tx_hook_eee = eee;
+    n2n_eth_tx_hook = edge_tx_from_device;
 
     eee->known_peers        = NULL;
     eee->pending_peers    = NULL;

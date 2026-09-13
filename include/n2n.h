@@ -133,6 +133,12 @@ int tuntap_write (struct tuntap_dev *tuntap, unsigned char *buf, int len);
 void tuntap_close (struct tuntap_dev *tuntap);
 void tuntap_get_address (struct tuntap_dev *tuntap);
 
+/* A layer-3 device emulating a layer-2 interface (utun on macos) sometimes
+ * needs to send ethernet frames of its own, ARP replies for example. The
+ * edge sets this hook on start-up so the device can hand such frames over. */
+typedef void (*n2n_eth_tx_hook_t)(uint8_t *buf, size_t len);
+extern n2n_eth_tx_hook_t n2n_eth_tx_hook;
+
 /* Utils */
 char* inaddrtoa (ipstr_t out, struct in_addr addr);
 char* intoa (uint32_t addr, char* buf, uint16_t buf_len);
